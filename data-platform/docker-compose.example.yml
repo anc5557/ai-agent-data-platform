@@ -1,0 +1,163 @@
+# Data Platform Docker Compose 예시
+# 민감 정보 익명화 처리됨
+
+x-airflow-build: &airflow-build
+  context: .
+  dockerfile: Dockerfile.airflow
+
+services:
+  # MinIO - S3 호환 오브젝트 스토리지
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      TZ: Asia/Seoul
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-yourpassword}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - data-platform
+
+  # PostgreSQL - Airflow 메타데이터 DB 및 Iceberg 카탈로그
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-yourpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data-platform
+
+  # Redis - Celery 브로커
+  redis:
+    image: redis:7
+    container_name: redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - data-platform
+
+  # Iceberg REST Catalog
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: iceberg-rest
+    restart: unless-stopped
+    environment:
+      - CATALOG_WAREHOUSE=s3://${WAREHOUSE_BUCKET:-lakehouse}/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_S3_ACCESS_KEY_ID=${MINIO_ROOT_USER:-admin}
+      - CATALOG_S3_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-yourpassword}
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+      - CATALOG_URI=jdbc:postgresql://postgres:5432/${ICEBERG_CATALOG_DB:-iceberg}
+      - CATALOG_JDBC_USER=${POSTGRES_USER:-admin}
+      - CATALOG_JDBC_PASSWORD=${POSTGRES_PASSWORD:-yourpassword}
+    ports:
+      - "${ICEBERG_REST_PORT:-8181}:8181"
+    depends_on:
+      - postgres
+      - minio
+    networks:
+      - data-platform
+
+  # Spark Master
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-master
+    restart: unless-stopped
+    environment:
+      - SPARK_MODE=master
+      - WAREHOUSE_BUCKET=${WAREHOUSE_BUCKET:-lakehouse}
+      - ICEBERG_REST_URI=http://iceberg-rest:8181
+      - S3_ENDPOINT=http://minio:9000
+    ports:
+      - "${SPARK_MASTER_PORT:-8081}:8080"
+      - "7077:7077"
+    networks:
+      - data-platform
+
+  # Spark Worker
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-worker
+    restart: unless-stopped
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    depends_on:
+      - spark-master
+    networks:
+      - data-platform
+
+  # Trino - SQL 쿼리 엔진
+  trino:
+    image: trinodb/trino:455
+    container_name: trino
+    restart: unless-stopped
+    volumes:
+      - ./configs/trino:/etc/trino:ro
+    ports:
+      - "${TRINO_PORT:-8082}:8080"
+    depends_on:
+      - iceberg-rest
+    networks:
+      - data-platform
+
+  # Milvus - 벡터 데이터베이스
+  milvus:
+    image: milvusdb/milvus:v2.6.4
+    container_name: milvus-standalone
+    restart: unless-stopped
+    environment:
+      - ETCD_ENDPOINTS=milvus-etcd:2379
+      - MINIO_ADDRESS=minio
+    ports:
+      - "${MILVUS_PORT:-19530}:19530"
+    depends_on:
+      - minio
+    networks:
+      - data-platform
+
+  # Airflow Webserver
+  airflow-webserver:
+    build: *airflow-build
+    container_name: airflow-webserver
+    restart: unless-stopped
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-yourpassword}@postgres:5432/${POSTGRES_DB:-airflow}
+      AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./spark-apps:/opt/airflow/spark-apps
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    command: webserver
+    networks:
+      - data-platform
+
+volumes:
+  minio_data:
+  postgres_data:
+  redis_data:
+
+
+networks:
+  data-platform:
+    driver: bridge
